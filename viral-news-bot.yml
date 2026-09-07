@@ -1,0 +1,39 @@
+name: Viral News Bot
+
+on:
+  schedule:
+    # Runs at the top of every hour (UTC). GitHub may delay this by a few
+    # minutes under load — that's normal for scheduled Actions.
+    - cron: "0 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated posted.json
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ secrets.CLAUDE_MODEL }}
+        run: python bot.py
+
+      - name: Save posted-story history
+        run: |
+          git config user.name "viral-news-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add posted.json
+          git diff --cached --quiet || git commit -m "Update posted-story log [skip ci]"
+          git push
