@@ -75,12 +75,19 @@ def fetch_reddit_popular(limit=15):
         title = d.get("title")
         if not title:
             continue
+        permalink = "https://reddit.com" + d.get("permalink", "")
+        is_self = d.get("is_self", False)
         items.append({
             "id": "reddit:" + d.get("id", title),
             "title": title,
-            "url": "https://reddit.com" + d.get("permalink", ""),
+            # prefer linking readers to the actual article; fall back to the
+            # Reddit thread itself for self/text posts
+            "url": permalink if is_self else d.get("url", permalink),
             "score": d.get("score", 0),
             "source": f"Reddit r/{d.get('subreddit', 'popular')}",
+            # used to fetch real content for the AI take, not just the title
+            "selftext": d.get("selftext", "") if is_self else "",
+            "content_url": permalink if is_self else d.get("url", ""),
         })
     return items
  
@@ -139,6 +146,8 @@ def fetch_google_trends(geo="US"):
                 "id": "gtrends:" + title.lower(),
                 "title": title,
                 "url": article_url,
+                "content_url": article_url,
+                "selftext": "",
                 "score": score,
                 "source": "Google Trends",
             })
@@ -186,19 +195,89 @@ def pick_candidate(items, state):
  
  
 # ---------------------------------------------------------------------------
+# Article content fetching (so the AI reads the real thing, not just a title)
+# ---------------------------------------------------------------------------
+ 
+ARTICLE_MAX_CHARS = 4000
+ 
+ 
+def fetch_article_text(url):
+    """Best-effort extraction of an article's main text. Returns '' on any
+    failure (paywall, bot-blocking, non-HTML content, etc.) — callers should
+    fall back to a title-only prompt in that case."""
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log("beautifulsoup4 not installed, skipping article fetch")
+        return ""
+ 
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; viral-news-bot/1.0)"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        if "text/html" not in resp.headers.get("Content-Type", ""):
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+            tag.decompose()
+        # article/main tags first (most news sites), fall back to all <p>s
+        container = soup.find("article") or soup.find("main") or soup
+        paragraphs = [p.get_text(" ", strip=True) for p in container.find_all("p")]
+        text = "\n".join(p for p in paragraphs if len(p) > 40)
+        return text[:ARTICLE_MAX_CHARS]
+    except Exception as e:
+        log(f"article fetch failed for {url}: {e}")
+        return ""
+ 
+ 
+def get_content_for_item(item):
+    """Real text to hand the model: Reddit self-post body, or a fetched
+    article page. Empty string if none could be obtained."""
+    if item.get("selftext"):
+        return item["selftext"][:ARTICLE_MAX_CHARS]
+    return fetch_article_text(item.get("content_url", ""))
+ 
+ 
+# ---------------------------------------------------------------------------
 # Post text generation
 # ---------------------------------------------------------------------------
  
-def generate_with_claude(item):
+def generate_with_claude(item, article_text):
+    if article_text:
+        source_block = (
+            f"Headline: {item['title']}\n"
+            f"Source: {item['source']}\n\n"
+            f"Full article text follows:\n\"\"\"\n{article_text}\n\"\"\"\n"
+        )
+        instructions = (
+            "Read the article text above yourself and form your own genuine "
+            "take on it — don't just reword the headline. Write 2-4 "
+            "sentences: what's actually going on based on what you read, and "
+            "your own perspective on why it matters, what's notable, or what "
+            "it might lead to. Ground your opinion in specific details from "
+            "the article, not generic filler."
+        )
+    else:
+        source_block = f"Headline: {item['title']}\nSource: {item['source']}\n"
+        instructions = (
+            "Only the headline is available (the full article couldn't be "
+            "fetched) — write 2 sentences of measured, appropriately "
+            "hedged context based on the headline alone. Don't invent "
+            "specifics you don't actually know."
+        )
+ 
     prompt = (
-        "You write short, neutral notes for a Telegram news channel about "
-        "what's currently trending/viral online. Given the story below, write "
-        "2-3 sentences: one summarizing what it is, and one adding brief, "
-        "even-handed context (why it might be getting attention, or what to "
-        "watch next). No hashtags, no strong opinions, no political "
-        "point-scoring. Plain text only.\n\n"
-        f"Story: {item['title']}\n"
-        f"Source: {item['source']}\n"
+        "You write short, neutral-but-substantive notes for a Telegram "
+        "channel about what's currently trending/viral online. "
+        "No hashtags, no political point-scoring, no strong ideological "
+        "stance — but do form and state an actual opinion/analysis rather "
+        "than just restating the headline. Plain text only.\n\n"
+        f"{source_block}\n{instructions}"
     )
     try:
         resp = requests.post(
@@ -210,7 +289,7 @@ def generate_with_claude(item):
             },
             json={
                 "model": CLAUDE_MODEL,
-                "max_tokens": 200,
+                "max_tokens": 300,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=REQUEST_TIMEOUT,
@@ -226,7 +305,9 @@ def generate_with_claude(item):
 def build_post_text(item):
     body = None
     if ANTHROPIC_API_KEY and CLAUDE_MODEL:
-        body = generate_with_claude(item)
+        article_text = get_content_for_item(item)
+        log(f"fetched {len(article_text)} chars of content for {item['title']!r}")
+        body = generate_with_claude(item, article_text)
  
     if not body:
         body = f"Trending now via {item['source']}."
